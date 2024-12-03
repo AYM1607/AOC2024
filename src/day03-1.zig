@@ -5,38 +5,50 @@ const fmt = std.fmt;
 const args = @import("lib/args.zig");
 const files = @import("lib/files.zig");
 
+// NOTE: These could probably be better defined, the state machine
+// reads a little weird because first and second are technically
+// a subset of mul.
 const Phase = enum {
     start,
     mul,
+    do,
+    dont,
     first,
     second,
 };
 
 const State = struct {
     prev: u8 = 0,
+
     phase: Phase = .start,
+
     num1: [3]u8 = undefined,
     num1_len: u8 = 0,
     num2: [3]u8 = undefined,
     num2_len: u8 = 0,
 
-    // The accumulator of all mul operations we've seen.
+    // Accumulators that never get reset.
     total: u64 = 0,
+    mul_enabled: bool = true,
 
-    // restart clear all fields except the running total.
-    fn restart(self: *State) void {
-        self.phase = .start;
+    // restartInstruction clears instruction related fields while keeping
+    // the running total and the mul_enabled state.
+    fn restartInstruction(self: *State, phase: Phase) void {
+        self.phase = phase;
         self.prev = 0;
         self.num1_len = 0;
         self.num2_len = 0;
     }
 
-    fn processInstruction(self: *State) !void {
+    fn processMul(self: *State) !void {
+        defer self.restartInstruction(.start);
+        if (!self.mul_enabled) {
+            return;
+        }
+
         const num1 = try fmt.parseUnsigned(u32, self.num1[0..self.num1_len], 10);
         const num2 = try fmt.parseUnsigned(u32, self.num2[0..self.num2_len], 10);
-
         self.total += num1 * num2;
-        self.restart();
     }
 
     fn advance(self: *State, next: u8) !void {
@@ -46,67 +58,150 @@ const State = struct {
             .start => {
                 if (next == 'm') {
                     self.phase = .mul;
+                } else if (next == 'd') {
+                    self.phase = .do;
                 }
             },
             .mul => {
-                switch (self.prev) {
-                    'm' => {
-                        if (next != 'u') {
-                            self.restart();
-                        }
-                    },
+                switch (next) {
                     'u' => {
-                        if (next != 'l') {
-                            self.restart();
+                        if (self.prev != 'm') {
+                            self.restartInstruction(.start);
                         }
                     },
                     'l' => {
-                        if (next != '(') {
-                            self.restart();
+                        if (self.prev != 'u') {
+                            self.restartInstruction(.start);
                         }
                     },
                     '(' => {
-                        if (next < '0' or next > '9') {
-                            self.restart();
+                        if (self.prev != 'l') {
+                            self.restartInstruction(.start);
+                        }
+                    },
+                    '0'...'9' => {
+                        if (self.prev != '(') {
+                            self.restartInstruction(.start);
                         } else {
                             self.num1[0] = next;
                             self.num1_len = 1;
                             self.phase = .first;
                         }
                     },
-                    else => unreachable,
+                    'd' => {
+                        self.restartInstruction(.do);
+                    },
+                    else => {
+                        self.restartInstruction(.start);
+                    },
                 }
             },
             .first => {
-                if (next == ',') {
-                    self.phase = .second;
-                } else if (next >= '0' and next <= '9') {
-                    if (self.num1_len == 3) {
-                        self.restart();
-                    } else {
-                        self.num1[self.num1_len] = next;
-                        self.num1_len += 1;
-                    }
-                } else {
-                    self.restart();
+                switch (next) {
+                    ',' => {
+                        self.phase = .second;
+                    },
+                    '0'...'9' => {
+                        if (self.num1_len == 3) {
+                            self.restartInstruction(.start);
+                        } else {
+                            self.num1[self.num1_len] = next;
+                            self.num1_len += 1;
+                        }
+                    },
+                    'd' => {
+                        self.restartInstruction(.do);
+                    },
+                    else => {
+                        self.restartInstruction(.start);
+                    },
                 }
             },
             .second => {
-                if (next == ')') {
-                    if (self.num2_len == 0) {
-                        self.restart();
-                    } else {
-                        try self.processInstruction();
-                    }
-                } else if (next >= '0' and next <= '9') {
-                    if (self.num2_len == 3) {
-                        self.restart();
-                    } else {
-                        self.num2[self.num2_len] = next;
-                        self.num2_len += 1;
-                    }
-                } else {
-                    self.restart();
+                switch (next) {
+                    ')' => {
+                        if (self.num2_len == 0) {
+                            self.restartInstruction(.start);
+                        } else {
+                            try self.processMul();
+                        }
+                    },
+                    '0'...'9' => {
+                        if (self.num2_len == 3) {
+                            self.restartInstruction(.start);
+                        } else {
+                            self.num2[self.num2_len] = next;
+                            self.num2_len += 1;
+                        }
+                    },
+                    'd' => {
+                        self.restartInstruction(.do);
+                    },
+                    else => {
+                        self.restartInstruction(.start);
+                    },
+                }
+            },
+            .do => {
+                switch (next) {
+                    'o' => {
+                        if (self.prev != 'd') {
+                            self.restartInstruction(.start);
+                        }
+                    },
+                    '(' => {
+                        if (self.prev != 'o') {
+                            self.restartInstruction(.start);
+                        }
+                    },
+                    ')' => {
+                        if (self.prev != '(') {
+                            self.restartInstruction(.start);
+                        } else {
+                            self.mul_enabled = true;
+                        }
+                    },
+                    'n' => {
+                        self.restartInstruction(if (self.prev == 'o') .dont else .start);
+                    },
+                    'm' => {
+                        self.restartInstruction(.mul);
+                    },
+                    else => {
+                        self.restartInstruction(.start);
+                    },
+                }
+            },
+            .dont => {
+                switch (next) {
+                    '\'' => {
+                        if (self.prev != 'n') {
+                            self.restartInstruction(.start);
+                        }
+                    },
+                    't' => {
+                        if (self.prev != '\'') {
+                            self.restartInstruction(.start);
+                        }
+                    },
+                    '(' => {
+                        if (self.prev != 't') {
+                            self.restartInstruction(.start);
+                        }
+                    },
+                    ')' => {
+                        if (self.prev != '(') {
+                            self.restartInstruction(.start);
+                        } else {
+                            self.mul_enabled = false;
+                        }
+                    },
+                    'm' => {
+                        self.restartInstruction(.mul);
+                    },
+                    else => {
+                        self.restartInstruction(.start);
+                    },
                 }
             },
         }

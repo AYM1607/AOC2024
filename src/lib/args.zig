@@ -2,6 +2,10 @@ const std = @import("std");
 const process = std.process;
 const print = std.debug.print;
 
+pub const ArgError = error{
+    MissingArguments,
+};
+
 pub fn getFirstArg() [:0]const u8 {
     var args = process.args();
     defer args.deinit();

@@ -6,6 +6,7 @@ pub const ArgError = error{
     MissingArguments,
 };
 
+// TODO: This erroring out would be a better API.
 pub fn getFirstArg() [:0]const u8 {
     var args = process.args();
     defer args.deinit();

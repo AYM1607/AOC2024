@@ -7,53 +7,85 @@ inline fn normalize(c: u8) u8 {
     return c - '0';
 }
 
-const FSEntryType = enum {
+const EntryType = enum {
     File,
-    EmptySpace,
+    EmptyRegion,
 };
 
-const FSEntry = struct {
-    size: usize,
-    typ: FSEntryType,
-    // Only appicable to Files, may be best
-    // expressed as a union?
+const File = struct {
     id: usize,
+    idx: usize,
+    size: usize,
+    relocated: bool = false,
 };
 
-// Could use an array list, this struct seems better since the max size is known.
-// Would be interesting to analyse the implications.
-const FSEntryIterator = struct {
-    size: usize = 0,
-    ptr: usize = 0,
-    items: [20000]FSEntry = undefined,
+const EmptyRegion = struct {
+    idx: usize,
+    size: usize,
+    insertions: [10]File = undefined,
+    insertions_pos: usize = 0,
+    insertions_size: usize = 0,
 
-    fn add(self: *FSEntryIterator, e: FSEntry) void {
-        self.items[self.size] = e;
-        self.size += 1;
+    fn actualSize(self: *EmptyRegion) usize {
+        return self.size - self.insertions_size;
     }
 
-    fn peek(self: *FSEntryIterator) ?FSEntry {
-        if (self.ptr == self.size) {
-            return null;
-        }
-        return self.items[self.ptr];
-    }
-
-    fn next(self: *FSEntryIterator) ?FSEntry {
-        if (self.ptr == self.size) {
-            return null;
-        }
-        defer self.ptr += 1;
-        return self.items[self.ptr];
+    fn addToInsertions(self: *EmptyRegion, f: File) void {
+        self.insertions[self.insertions_pos] = f;
+        self.insertions_pos += 1;
+        self.insertions_size += f.size;
     }
 };
 
-fn fsEntryFromIdx(dense: []u8, relocated: [20000]bool, idx: usize) FSEntry {
-    return FSEntry{
+const Entry = union(EntryType) {
+    File: File,
+    EmptyRegion: EmptyRegion,
+};
+
+const EntryIterator = struct {
+    pos: usize = 0,
+    entries: std.ArrayList(Entry),
+
+    // peek gets the entry at pos without
+    // moving it.
+    fn peek(self: *EntryIterator) ?Entry {
+        if (self.pos >= self.entries.items.len) {
+            return null;
+        }
+        return self.entries.items[self.pos];
+    }
+
+    // shift gets the entry at pos and moves pos.
+    fn shift(self: *EntryIterator) !void {
+        if (self.pos >= self.entries.items.len) {
+            return error.ShiftedEmptyIterator;
+        }
+        self.pos += 1;
+    }
+
+    // add an entry where it's supposed to go, depending on its index.
+    fn addOrdered(self: *EntryIterator, e: Entry) !void {
+        if (e == EntryType.File) {
+            return error.CannotIterateOverFiles;
+        }
+        var idx: usize = self.pos;
+        while (e.EmptyRegion.idx > self.entries.items[idx].EmptyRegion.idx) : (idx += 1) {}
+        try self.entries.insert(idx, e);
+    }
+};
+
+fn entryFromIdx(dense: []u8, idx: usize) Entry {
+    if (idx % 2 == 0) {
+        return Entry{ .File = File{
+            .id = idx / 2,
+            .idx = idx,
+            .size = normalize(dense[idx]),
+        } };
+    }
+    return Entry{ .EmptyRegion = EmptyRegion{
+        .idx = idx,
         .size = normalize(dense[idx]),
-        .typ = if (relocated[idx]) .EmptySpace else if (idx % 2 == 0) .File else .EmptySpace,
-        .id = idx / 2,
-    };
+    } };
 }
 
 pub fn main() !void {
@@ -61,74 +93,95 @@ pub fn main() !void {
     const input = try files.openForReading(input_path);
     defer input.close();
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var line_buf: [20000]u8 = undefined;
     const dense = try files.readLine(input, &line_buf);
 
-    var entries_by_size: [10]FSEntryIterator = .{FSEntryIterator{}} ** 10;
-    var relocated: [20000]bool = .{false} ** 20000;
-
-    var idx: usize = dense.len - 1;
-    while (idx >= 2) : (idx -= 2) {
-        const entry = fsEntryFromIdx(dense, relocated, idx);
-        entries_by_size[entry.size].add(entry);
+    // Only empty spaces will be stored here.
+    var entries_by_size: [10]EntryIterator = undefined;
+    for (0..10) |i| {
+        entries_by_size[i].pos = 0;
+        entries_by_size[i].entries = try std.ArrayList(Entry).initCapacity(allocator, 20000);
     }
 
-    var entry: FSEntry = fsEntryFromIdx(dense, relocated, 0);
-    var entry_pos: usize = 0;
-    var fsIdx: usize = 0;
+    var fs: [20000]Entry = undefined;
+    for (0..dense.len) |i| {
+        const entry = entryFromIdx(dense, i);
+        fs[i] = entry;
+        if (entry == EntryType.EmptyRegion) {
+            try entries_by_size[entry.EmptyRegion.size].entries.append(entry);
+        }
+    }
 
-    var checksum: u128 = 0;
-    idx = 0;
-    entries: while (idx < dense.len) {
-        if (entry_pos >= entry.size) {
-            if (idx == dense.len - 1) {
-                break;
+    // Try to move files to the left.
+    var i: usize = dense.len + 1;
+    while (i > 0) {
+        i -= 2;
+        const entry = fs[i];
+
+        // Try to find a spot that fits it.
+        var min_idx: usize = 20000;
+        var chosen_slot: ?EmptyRegion = null;
+        for (entry.File.size..10) |s| {
+            if (entries_by_size[s].peek()) |cs| {
+                if (chosen_slot == null or cs.EmptyRegion.idx < min_idx) {
+                    chosen_slot = cs.EmptyRegion;
+                    min_idx = cs.EmptyRegion.idx;
+                }
             }
-            entry = fsEntryFromIdx(dense, relocated, idx + 1);
-            idx += 1;
-            entry_pos = 0;
+        }
+        if (chosen_slot == null or chosen_slot.?.idx > entry.File.idx) {
             continue;
         }
-        switch (entry.typ) {
-            .File => {
-                print("{d}", .{entry.id});
-                checksum += fsIdx * entry.id;
-                fsIdx += 1;
-                entry_pos += 1;
-            },
-            .EmptySpace => {
-                const remaining_slots = entry.size - entry_pos;
-                var size = remaining_slots;
 
-                var largest_id_size: usize = undefined;
-                var largest_id: ?usize = null;
-                while (size > 0) : (size -= 1) {
-                    if (entries_by_size[size].peek()) |e| {
-                        if (largest_id == null or e.id > largest_id.?) {
-                            largest_id = e.id;
-                            largest_id_size = e.size;
-                        }
-                    }
+        try entries_by_size[chosen_slot.?.actualSize()].shift();
+        // If there's a spot, mark it as relocated.
+        fs[i].File.relocated = true;
+        // Add the file to the insertions.
+        chosen_slot.?.addToInsertions(entry.File);
+        fs[chosen_slot.?.idx] = Entry{ .EmptyRegion = chosen_slot.? };
+
+        // if the selected empty region has slots left, update it an re-insert it.
+        if (chosen_slot.?.actualSize() > 0) {
+            try entries_by_size[chosen_slot.?.actualSize()].addOrdered(fs[chosen_slot.?.idx]);
+        }
+    }
+
+    // Calculate checksum.
+    var fsIdx: usize = 0;
+    var checksum: u128 = 0;
+    for (0..dense.len) |di| {
+        switch (fs[di]) {
+            EntryType.File => |file| {
+                if (file.relocated) {
+                    // for (0..file.size) |_| {
+                    //     print(".", .{});
+                    // }
+                    fsIdx += file.size;
+                    continue;
                 }
-
-                size = largest_id_size;
-                if (largest_id) |id| {
-                    _ = entries_by_size[size].next();
-                    for (0..size) |_| {
-                        print("{d}", .{id});
-                        checksum += fsIdx * id;
+                for (0..file.size) |_| {
+                    // print("{d}", .{file.id});
+                    checksum += fsIdx * file.id;
+                    fsIdx += 1;
+                }
+            },
+            EntryType.EmptyRegion => |empty| {
+                for (0..empty.insertions_pos) |ins_i| {
+                    const f = empty.insertions[ins_i];
+                    for (0..f.size) |_| {
+                        // print("{d}", .{f.id});
+                        checksum += fsIdx * f.id;
                         fsIdx += 1;
                     }
-                    relocated[id * 2] = true;
-                    entry_pos += size;
-                    continue :entries;
                 }
-
-                for (0..remaining_slots) |_| {
-                    print(".", .{});
-                }
-                entry_pos += remaining_slots;
-                fsIdx += remaining_slots;
+                fsIdx += empty.size - empty.insertions_size;
+                // for (0..(empty.size - empty.insertions_size)) |_| {
+                //     print(".", .{});
+                // }
             },
         }
     }
